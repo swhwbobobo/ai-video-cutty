@@ -3,6 +3,7 @@
 #include <shellapi.h>
 #include <shobjidl.h>
 #include <mfapi.h>
+#include <mferror.h>
 #include <mfidl.h>
 #include <mfmediaengine.h>
 #include <d3d11.h>
@@ -26,8 +27,8 @@ namespace fs = std::filesystem;
 namespace {
 constexpr UINT kMediaEvent = WM_APP + 1, kInitialize = WM_APP + 2;
 constexpr UINT_PTR kTick = 1;
-constexpr int kOpen = 100, kPlay, kBack, kForward, kMarkA, kMarkB,
-    kClear, kLoop, kScreenshot, kMute, kSpeed, kSeek;
+enum ControlId : int { kOpen = 100, kPlay, kBack, kForward, kMarkA, kMarkB,
+    kClear, kLoop, kScreenshot, kMute, kSpeed, kSeek };
 constexpr wchar_t kTitle[] = L"AI Video Cutty · Windows 播放原型";
 
 struct Failure : std::runtime_error {
@@ -161,7 +162,7 @@ public:
         if (!name) throw Failure(E_OUTOFMEMORY);
         const HRESULT hr = extended_->SetSourceFromByteStream(stream_.Get(), name);
         SysFreeString(name); require(hr);
-        require(engine_->SetPreload(MF_MEDIA_ENGINE_PRELOAD_AUTO));
+        require(engine_->SetPreload(MF_MEDIA_ENGINE_PRELOAD_AUTOMATIC));
         require(engine_->Load());
     }
     void resize() {
