@@ -766,9 +766,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         cls.lpszClassName = L"CuttyVideoSurface"; cls.lpfnWndProc = videoProcedure;
         cls.hbrBackground = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
         RegisterClassExW(&cls);
+        // CreateWindowExW takes physical pixels; the control layout uses DPI-scaled units.
+        const UINT initialDpi = GetDpiForSystem();
         HWND window = CreateWindowExW(WS_EX_ACCEPTFILES, L"AIVideoCuttyWindows", kTitle,
             WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT,
-            1100, 720, nullptr, nullptr, instance, &app);
+            MulDiv(1100, initialDpi, 96), MulDiv(720, initialDpi, 96),
+            nullptr, nullptr, instance, &app);
         if (!window) result = 1;
         else {
             ShowWindow(window, show); UpdateWindow(window);
