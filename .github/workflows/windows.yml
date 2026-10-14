@@ -1,0 +1,44 @@
+name: Windows playback prototype
+
+on:
+  push:
+    branches: [codex/windows-playback-prototype]
+    paths: ['Windows/**', '.github/workflows/windows.yml']
+  pull_request:
+    paths: ['Windows/**', '.github/workflows/windows.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Configure x64 native prototype
+        run: cmake -S Windows -B build/windows -A x64
+      - name: Build release
+        run: cmake --build build/windows --config Release
+      - name: Verify playback rules
+        run: ctest --test-dir build/windows -C Release --output-on-failure
+      - name: Package portable executable
+        shell: pwsh
+        run: |
+          cmake --install build/windows --config Release --prefix dist/windows
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $exe = Get-Item dist/windows/AIVideoCutty.exe
+          Write-Output "EXE bytes: $($exe.Length)"
+          if ($exe.Length -gt 10MB) { throw 'Prototype EXE exceeds 10 MiB budget' }
+          Compress-Archive -Path dist/windows/* -DestinationPath dist/AI-Video-Cutty-Windows-x64-prototype.zip
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: AI-Video-Cutty-Windows-x64-prototype
+          path: dist/AI-Video-Cutty-Windows-x64-prototype.zip
+          if-no-files-found: error
+          retention-days: 14
