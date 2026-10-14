@@ -1,4 +1,5 @@
 #include <windows.h>
+#include <windowsx.h>
 #include <commctrl.h>
 #include <shellapi.h>
 #include <shobjidl.h>
@@ -6,19 +7,28 @@
 #include <mferror.h>
 #include <mfidl.h>
 #include <mfmediaengine.h>
+#include <mfreadwrite.h>
 #include <d3d11.h>
 #include <d3d10.h>
 #include <dxgi.h>
 #include <wincodec.h>
 #include <wrl/client.h>
 #include <atomic>
+#include <algorithm>
+#include <array>
 #include <chrono>
+#include <cmath>
 #include <cwctype>
+#include <deque>
 #include <filesystem>
 #include <iomanip>
+#include <memory>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 #include "PlaybackRules.h"
 
@@ -26,10 +36,19 @@ using Microsoft::WRL::ComPtr;
 namespace fs = std::filesystem;
 namespace {
 constexpr UINT kMediaEvent = WM_APP + 1, kInitialize = WM_APP + 2;
-constexpr UINT_PTR kTick = 1;
+constexpr UINT kTimelineMove = WM_APP + 3, kTimelineLeave = WM_APP + 4, kPreviewReady = WM_APP + 5;
+constexpr UINT_PTR kTick = 1, kHoverTick = 2;
 enum ControlId : int { kOpen = 100, kPlay, kBack, kForward, kMarkA, kMarkB,
-    kClear, kLoop, kScreenshot, kMute, kSpeed, kSeek };
+    kClear, kLoop, kScreenshot, kMute, kRestart, kVolume, kTimeline, kSpeedFirst = 200 };
+constexpr double kSpeedOrder[] = {8, 4, 2, 1.5, 1.25, 1, 0.75, 0.5};
 constexpr wchar_t kTitle[] = L"AI Video Cutty · Windows 播放原型";
+constexpr COLORREF kBackground = RGB(25, 25, 25);
+constexpr COLORREF kControl = RGB(57, 57, 57);
+constexpr COLORREF kBlue = RGB(10, 132, 255);
+constexpr UINT kPreviewWidth = 160, kPreviewHeight = 90;
+
+LRESULT CALLBACK timelineProcedure(HWND, UINT, WPARAM, LPARAM);
+LRESULT CALLBACK volumeProcedure(HWND, UINT, WPARAM, LPARAM);
 
 struct Failure : std::runtime_error {
     HRESULT code;
@@ -53,6 +72,177 @@ std::wstring timeText(double time) {
     text << milliseconds / 60000 << L":" << std::setw(2) << std::setfill(L'0')
          << milliseconds / 1000 % 60 << L"." << std::setw(3) << milliseconds % 1000;
     return text.str();
+}
+
+struct TimelineFrame {
+    UINT width = 0, height = 0;
+    std::vector<BYTE> pixels;
+};
+struct PendingPreview {
+    ULONG generation = 0;
+    size_t index = 0;
+    TimelineFrame frame;
+};
+struct PreviewState {
+    std::mutex mutex;
+    std::deque<PendingPreview> ready;
+    std::vector<float> waveform;
+    ULONG waveformGeneration = 0;
+    std::atomic<ULONG> generation{0};
+    std::atomic<HWND> window{nullptr};
+};
+
+void generatePreviews(std::shared_ptr<PreviewState> state, fs::path path, ULONG generation) {
+    if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) return;
+    if (FAILED(MFStartup(MF_VERSION))) { CoUninitialize(); return; }
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    try {
+        ComPtr<IMFAttributes> attributes;
+        require(MFCreateAttributes(&attributes, 1));
+        require(attributes->SetUINT32(MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, TRUE));
+        ComPtr<IMFByteStream> stream;
+        require(MFCreateFile(MF_ACCESSMODE_READ, MF_OPENMODE_FAIL_IF_NOT_EXIST,
+            MF_FILEFLAGS_NONE, path.c_str(), &stream));
+        ComPtr<IMFSourceReader> reader;
+        require(MFCreateSourceReaderFromByteStream(stream.Get(), attributes.Get(), &reader));
+        require(reader->SetStreamSelection(static_cast<DWORD>(MF_SOURCE_READER_ALL_STREAMS), FALSE));
+        require(reader->SetStreamSelection(static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), TRUE));
+        ComPtr<IMFMediaType> output;
+        require(MFCreateMediaType(&output));
+        require(output->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video));
+        require(output->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32));
+        require(MFSetAttributeSize(output.Get(), MF_MT_FRAME_SIZE, kPreviewWidth, kPreviewHeight));
+        require(reader->SetCurrentMediaType(static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), nullptr, output.Get()));
+        ComPtr<IMFMediaType> configured;
+        require(reader->GetCurrentMediaType(static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), &configured));
+        UINT32 width = 0, height = 0;
+        require(MFGetAttributeSize(configured.Get(), MF_MT_FRAME_SIZE, &width, &height));
+        if (!width || !height || width > 512 || height > 288) throw Failure(E_OUTOFMEMORY);
+        PROPVARIANT length{};
+        require(reader->GetPresentationAttribute(static_cast<DWORD>(MF_SOURCE_READER_MEDIASOURCE), MF_PD_DURATION, &length));
+        const ULONGLONG duration = length.vt == VT_UI8 ? length.uhVal.QuadPart : 0;
+        PropVariantClear(&length);
+        if (!duration) throw Failure(MF_E_INVALIDREQUEST);
+        for (size_t index = 0; index < 10 && state->generation.load() == generation; ++index) {
+            PROPVARIANT position{}; position.vt = VT_I8;
+            position.hVal.QuadPart = static_cast<LONGLONG>(duration / 10 * index);
+            require(reader->SetCurrentPosition(GUID_NULL, position));
+            ComPtr<IMFSample> sample;
+            for (int attempt = 0; attempt < 30 && !sample; ++attempt) {
+                DWORD streamIndex = 0, flags = 0; LONGLONG timestamp = 0;
+                require(reader->ReadSample(static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), 0,
+                    &streamIndex, &flags, &timestamp, &sample));
+                if (flags & MF_SOURCE_READERF_ENDOFSTREAM) break;
+            }
+            if (!sample) continue;
+            ComPtr<IMFMediaBuffer> buffer;
+            require(sample->ConvertToContiguousBuffer(&buffer));
+            TimelineFrame frame; frame.width = width; frame.height = height;
+            frame.pixels.resize(static_cast<size_t>(width) * height * 4);
+            ComPtr<IMF2DBuffer> twoD;
+            if (SUCCEEDED(buffer.As(&twoD))) {
+                BYTE* top = nullptr; LONG stride = 0;
+                require(twoD->Lock2D(&top, &stride));
+                for (UINT y = 0; y < height; ++y)
+                    memcpy(frame.pixels.data() + static_cast<size_t>(y) * width * 4,
+                        top + static_cast<ptrdiff_t>(y) * stride, static_cast<size_t>(width) * 4);
+                twoD->Unlock2D();
+            } else {
+                BYTE* bytes = nullptr; DWORD capacity = 0, lengthBytes = 0;
+                require(buffer->Lock(&bytes, &capacity, &lengthBytes));
+                if (lengthBytes >= frame.pixels.size())
+                    memcpy(frame.pixels.data(), bytes, frame.pixels.size());
+                else { buffer->Unlock(); continue; }
+                buffer->Unlock();
+            }
+            if (state->generation.load() != generation) break;
+            {
+                std::lock_guard lock(state->mutex);
+                if (state->generation.load() != generation) break;
+                if (state->ready.size() == 10) state->ready.pop_front();
+                state->ready.push_back(PendingPreview{generation, index, std::move(frame)});
+            }
+            if (const HWND window = state->window.load()) PostMessageW(window, kPreviewReady, 0, 0);
+        }
+        stream->Close();
+    } catch (...) { /* Unsupported media keeps the ten bounded empty cells. */ }
+    MFShutdown(); CoUninitialize();
+}
+
+void generateWaveform(std::shared_ptr<PreviewState> state, fs::path path, ULONG generation) {
+    if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) return;
+    if (FAILED(MFStartup(MF_VERSION))) { CoUninitialize(); return; }
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    try {
+        ComPtr<IMFByteStream> stream;
+        require(MFCreateFile(MF_ACCESSMODE_READ, MF_OPENMODE_FAIL_IF_NOT_EXIST,
+            MF_FILEFLAGS_NONE, path.c_str(), &stream));
+        ComPtr<IMFSourceReader> reader;
+        require(MFCreateSourceReaderFromByteStream(stream.Get(), nullptr, &reader));
+        require(reader->SetStreamSelection(static_cast<DWORD>(MF_SOURCE_READER_ALL_STREAMS), FALSE));
+        require(reader->SetStreamSelection(static_cast<DWORD>(MF_SOURCE_READER_FIRST_AUDIO_STREAM), TRUE));
+        ComPtr<IMFMediaType> output;
+        require(MFCreateMediaType(&output));
+        require(output->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio));
+        require(output->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_PCM));
+        require(output->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, 1));
+        require(output->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, 8000));
+        require(output->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16));
+        require(output->SetUINT32(MF_MT_AUDIO_BLOCK_ALIGNMENT, 2));
+        require(output->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 16000));
+        require(reader->SetCurrentMediaType(static_cast<DWORD>(MF_SOURCE_READER_FIRST_AUDIO_STREAM), nullptr, output.Get()));
+        PROPVARIANT length{};
+        require(reader->GetPresentationAttribute(static_cast<DWORD>(MF_SOURCE_READER_MEDIASOURCE), MF_PD_DURATION, &length));
+        const ULONGLONG duration = length.vt == VT_UI8 ? length.uhVal.QuadPart : 0;
+        PropVariantClear(&length);
+        if (!duration) throw Failure(MF_E_INVALIDREQUEST);
+        std::vector<float> bars(240, 0);
+        int emptyReads = 0;
+        while (state->generation.load() == generation) {
+            DWORD streamIndex = 0, flags = 0; LONGLONG timestamp = 0;
+            ComPtr<IMFSample> sample;
+            require(reader->ReadSample(static_cast<DWORD>(MF_SOURCE_READER_FIRST_AUDIO_STREAM), 0,
+                &streamIndex, &flags, &timestamp, &sample));
+            if (flags & MF_SOURCE_READERF_ENDOFSTREAM) break;
+            if (!sample) { if (++emptyReads > 100) break; continue; }
+            emptyReads = 0;
+            ComPtr<IMFMediaBuffer> buffer;
+            require(sample->ConvertToContiguousBuffer(&buffer));
+            BYTE* bytes = nullptr; DWORD capacity = 0, lengthBytes = 0;
+            require(buffer->Lock(&bytes, &capacity, &lengthBytes));
+            int peak = 0;
+            for (DWORD offset = 0; offset + 1 < lengthBytes; offset += 2) {
+                const int value = static_cast<short>(bytes[offset] | (bytes[offset + 1] << 8));
+                peak = std::max(peak, std::abs(value));
+            }
+            buffer->Unlock();
+            LONGLONG sampleDuration = 0;
+            sample->GetSampleDuration(&sampleDuration);
+            const auto barAt = [duration](LONGLONG time) {
+                return static_cast<size_t>(std::clamp(
+                    static_cast<double>(std::max<LONGLONG>(time, 0)) * 240.0 / duration,
+                    0.0, 239.0));
+            };
+            const auto first = barAt(timestamp);
+            const auto last = barAt(timestamp + std::max<LONGLONG>(sampleDuration, 0));
+            for (size_t index = first; index <= last; ++index)
+                bars[index] = std::max(bars[index], peak / 32768.0f);
+        }
+        if (state->generation.load() == generation) {
+            const float maximum = *std::max_element(bars.begin(), bars.end());
+            if (maximum > 0) for (float& bar : bars) bar /= maximum;
+            {
+                std::lock_guard lock(state->mutex);
+                if (state->generation.load() == generation) {
+                    state->waveform = std::move(bars);
+                    state->waveformGeneration = generation;
+                }
+            }
+            if (const HWND window = state->window.load()) PostMessageW(window, kPreviewReady, 0, 0);
+        }
+        stream->Close();
+    } catch (...) { /* Unsupported audio leaves the bounded empty timeline. */ }
+    MFShutdown(); CoUninitialize();
 }
 
 // Media callbacks are on MF threads. Only the UI thread touches UI/playback state.
@@ -277,24 +467,31 @@ public:
 
 class Application {
     HWND window_ = nullptr, video_ = nullptr, information_ = nullptr, position_ = nullptr;
-    HWND help_ = nullptr, seek_ = nullptr, speed_ = nullptr;
+    HWND help_ = nullptr, timeline_ = nullptr, volume_ = nullptr;
+    HWND speedButtons_[ARRAYSIZE(kSpeedOrder)]{};
     std::vector<HWND> buttons_;
+    std::array<TimelineFrame, 10> previews_;
+    std::vector<float> waveform_;
+    std::shared_ptr<PreviewState> previewState_ = std::make_shared<PreviewState>();
     Player player_;
     fs::path source_;
     fs::path pendingSource_;
     cutty::Markers markers_;
     bool initialized_ = false, loaded_ = false, loop_ = true, framePending_ = false;
-    bool loopSeeking_ = false, dragging_ = false, temporaryShuttle_ = false;
+    bool loopSeeking_ = false, temporaryShuttle_ = false, hoverActive_ = false;
+    bool oldMuted_ = false;
     bool fullscreen_ = false;
     WINDOWPLACEMENT savedPlacement_{sizeof(WINDOWPLACEMENT)};
     LONG_PTR savedStyle_ = 0;
-    double chosenRate_ = 1.0, resumeRate_ = 1.0, jklRate_ = 0;
+    double chosenRate_ = 1.0, resumeRate_ = 1.0, jklRate_ = 0, hoverRate_ = 0;
+    double hoverFraction_ = -1;
     UINT dpi_ = 96;
     HFONT font_ = nullptr;
+    HBRUSH backgroundBrush_ = CreateSolidBrush(kBackground);
     std::wstring message_ = L"打开本地视频或音频，或把文件拖入窗口。";
     ULONGLONG lastUiTick_ = 0;
     std::chrono::steady_clock::time_point opened_;
-    bool firstFrameRecorded_ = false, autoplayPending_ = false;
+    bool firstFrameRecorded_ = false, autoplayPending_ = false, previewStarted_ = false;
     UINT timerPeriod_ = 0;
     ULONGLONG frameDeadline_ = 0;
 
@@ -312,21 +509,22 @@ class Application {
         font_ = CreateFontW(-scale(14), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
             DEFAULT_PITCH, L"Segoe UI");
-        information_ = control(L"STATIC", L"", SS_LEFT, 0);
+        information_ = control(L"STATIC", L"", SS_LEFT | SS_ENDELLIPSIS, 0);
         video_ = control(L"CuttyVideoSurface", L"", WS_CLIPSIBLINGS, 0);
-        position_ = control(L"STATIC", L"", SS_LEFT, 0);
-        help_ = control(L"STATIC", L"Space 播放/暂停 · ←/→ 逐帧/穿梭 · I/O 标记 · J/K/L · Ctrl+←/→ 跳 5% · F11 全屏", SS_LEFT, 0);
+        position_ = control(L"STATIC", L"", SS_CENTER, 0);
+        help_ = control(L"STATIC", L"", SS_LEFT | SS_ENDELLIPSIS, 0);
         const struct { const wchar_t* title; int id; } controls[] = {
-            {L"打开…", kOpen}, {L"播放", kPlay}, {L"← 一帧", kBack}, {L"一帧 →", kForward},
-            {L"A (I)", kMarkA}, {L"B (O)", kMarkB}, {L"清除 (X)", kClear},
-            {L"循环 (P)", kLoop}, {L"截图…", kScreenshot}, {L"静音 (M)", kMute}};
-        for (const auto& item : controls) buttons_.push_back(control(L"BUTTON", item.title, BS_PUSHBUTTON, item.id));
-        speed_ = control(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_VSCROLL, kSpeed);
-        for (const auto label : {L"0.5×", L"1×", L"1.5×", L"2×", L"4×", L"8×"})
-            SendMessageW(speed_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label));
-        SendMessageW(speed_, CB_SETCURSEL, 1, 0);
-        seek_ = control(TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_NOTICKS, kSeek);
-        SendMessageW(seek_, TBM_SETRANGE, TRUE, MAKELPARAM(0, 10000));
+            {L"打开…", kOpen}, {L"静音", kMute}, {L"↶ 开头", kRestart},
+            {L"截图", kScreenshot}, {L"循环", kLoop}, {L"清除 A-B", kClear}};
+        for (const auto& item : controls) buttons_.push_back(control(L"BUTTON", item.title, BS_OWNERDRAW, item.id));
+        const wchar_t* speedLabels[] = {L"8×", L"4×", L"2×", L"1.5×", L"1.25×", L"1×", L"0.75×", L"0.5×"};
+        for (size_t index = 0; index < ARRAYSIZE(kSpeedOrder); ++index) {
+            speedButtons_[index] = control(L"BUTTON", speedLabels[index], BS_OWNERDRAW,
+                kSpeedFirst + static_cast<int>(index));
+            buttons_.push_back(speedButtons_[index]);
+        }
+        volume_ = control(L"CuttyVolume", L"", 0, kVolume);
+        timeline_ = control(L"CuttyTimeline", L"", 0, kTimeline);
         DragAcceptFiles(window_, TRUE);
         layout(); update();
     }
@@ -334,7 +532,7 @@ class Application {
         HFONT next = CreateFontW(-scale(14), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
             DEFAULT_PITCH, L"Segoe UI");
-        for (const auto child : {information_, position_, help_, speed_, seek_})
+        for (const auto child : {information_, position_, help_})
             SendMessageW(child, WM_SETFONT, reinterpret_cast<WPARAM>(next), TRUE);
         for (HWND child : buttons_) SendMessageW(child, WM_SETFONT, reinterpret_cast<WPARAM>(next), TRUE);
         if (font_) DeleteObject(font_);
@@ -343,21 +541,39 @@ class Application {
     void layout() {
         if (!video_) return;
         RECT bounds{}; GetClientRect(window_, &bounds);
-        const int margin = scale(12), width = std::max(1L, bounds.right - 2 * margin);
-        const int buttonHeight = scale(30), row = scale(36), bottom = scale(154);
-        MoveWindow(information_, margin, margin, width, scale(24), TRUE);
-        MoveWindow(video_, margin, scale(42), width, std::max<LONG>(scale(40), bounds.bottom - scale(42) - bottom), TRUE);
-        const int base = bounds.bottom - bottom + scale(6);
-        MoveWindow(position_, margin, base, width, scale(24), TRUE);
-        MoveWindow(seek_, margin, base + scale(26), width, scale(25), TRUE);
-        int x = margin;
-        const int sizes[] = {72, 68, 70, 70, 58, 58, 76, 80, 72, 76};
-        for (size_t i = 0; i < buttons_.size(); ++i) {
-            MoveWindow(buttons_[i], x, base + scale(55), scale(sizes[i]), buttonHeight, TRUE);
-            x += scale(sizes[i] + 5);
+        const int margin = scale(14), width = std::max(1L, bounds.right - 2 * margin);
+        const int rail = scale(136), gap = scale(12), timelineHeight = scale(76);
+        const int timelineY = bounds.bottom - margin - scale(24) - timelineHeight;
+        const int mediaY = scale(52), mediaBottom = timelineY - scale(29);
+        const int mediaHeight = std::max(scale(40), mediaBottom - mediaY);
+        const int videoX = margin + rail + gap;
+        const int videoWidth = std::max(1, width - 2 * (rail + gap));
+        MoveWindow(GetDlgItem(window_, kOpen), margin, scale(10), scale(96), scale(34), TRUE);
+        MoveWindow(information_, margin + scale(110), scale(13), std::max(1, width - scale(110)), scale(28), TRUE);
+        MoveWindow(video_, videoX, mediaY, videoWidth, mediaHeight, TRUE);
+        MoveWindow(position_, margin, timelineY - scale(24), width, scale(21), TRUE);
+        MoveWindow(timeline_, margin, timelineY, width, timelineHeight, TRUE);
+        MoveWindow(help_, margin, bounds.bottom - margin - scale(18), width, scale(20), TRUE);
+
+        const int volumeY = mediaY + std::max(0, (mediaHeight - scale(366)) / 2);
+        const int volumeHeight = std::min(scale(270), std::max(scale(120), mediaHeight - scale(96)));
+        MoveWindow(volume_, margin + scale(17), volumeY, scale(42), volumeHeight, TRUE);
+        MoveWindow(GetDlgItem(window_, kMute), margin + scale(6), volumeY + volumeHeight + scale(8), scale(64), scale(40), TRUE);
+        MoveWindow(GetDlgItem(window_, kRestart), margin, volumeY + volumeHeight + scale(56), scale(76), scale(40), TRUE);
+        MoveWindow(GetDlgItem(window_, kScreenshot), margin + scale(83),
+            mediaY + (mediaHeight - scale(46)) / 2, scale(46), scale(46), TRUE);
+
+        const int rightX = bounds.right - margin - scale(104);
+        const int buttonWidth = scale(96), spacing = scale(3);
+        const int count = static_cast<int>(ARRAYSIZE(kSpeedOrder)) + 2;
+        const int buttonHeight = std::min(scale(40), std::max(scale(24), (mediaHeight - spacing * (count - 1)) / count));
+        int y = mediaY + std::max(0, (mediaHeight - count * (buttonHeight + spacing) + spacing) / 2);
+        for (HWND button : speedButtons_) {
+            MoveWindow(button, rightX, y, buttonWidth, buttonHeight, TRUE);
+            y += buttonHeight + spacing;
         }
-        MoveWindow(speed_, x, base + scale(55), scale(76), scale(220), TRUE);
-        MoveWindow(help_, margin, base + scale(55) + row, width, scale(44), TRUE);
+        MoveWindow(GetDlgItem(window_, kLoop), rightX, y, buttonWidth, buttonHeight, TRUE); y += buttonHeight + spacing;
+        MoveWindow(GetDlgItem(window_, kClear), rightX, y, buttonWidth, buttonHeight, TRUE);
         if (initialized_) player_.resize();
     }
     void update() {
@@ -375,23 +591,22 @@ class Application {
         }
         SetWindowTextW(information_, info.c_str());
         std::wstring position = timeText(current) + L" / " + timeText(duration);
-        position += L"    A: " + (markers_.a ? timeText(*markers_.a) : L"片头");
-        position += L"    B: " + (markers_.b ? timeText(*markers_.b) : L"片尾");
-        position += L"    " + message_;
         SetWindowTextW(position_, position.c_str());
-        if (!dragging_ && cutty::validDuration(duration))
-            SendMessageW(seek_, TBM_SETPOS, TRUE, static_cast<LPARAM>(10000 * cutty::boundedTime(current, duration) / duration));
+        SetWindowTextW(help_, message_.c_str());
+        InvalidateRect(timeline_, nullptr, FALSE);
+        const LONG_PTR volume = static_cast<LONG_PTR>(std::lround(engine ? engine->GetVolume() * 100 : 100));
+        if (GetWindowLongPtrW(volume_, GWLP_USERDATA) != volume) {
+            SetWindowLongPtrW(volume_, GWLP_USERDATA, volume);
+            InvalidateRect(volume_, nullptr, FALSE);
+        }
         for (HWND button : buttons_) {
             const int id = GetDlgCtrlID(button);
             bool enabled = id == kOpen || loaded_;
-            if (id == kScreenshot || id == kBack || id == kForward)
+            if (id == kScreenshot)
                 enabled = loaded_ && engine && engine->HasVideo() && !framePending_ && !engine->IsSeeking();
             EnableWindow(button, enabled);
+            InvalidateRect(button, nullptr, FALSE);
         }
-        EnableWindow(speed_, loaded_); EnableWindow(seek_, loaded_ && cutty::validDuration(duration));
-        SetWindowTextW(GetDlgItem(window_, kPlay), loaded_ && engine && !engine->IsPaused() ? L"暂停" : L"播放");
-        SetWindowTextW(GetDlgItem(window_, kLoop), loop_ ? L"循环：开" : L"循环：关");
-        SetWindowTextW(GetDlgItem(window_, kMute), engine && engine->GetMuted() ? L"声音：关" : L"声音：开");
     }
     void updateTimer() {
         auto* engine = player_.engine();
@@ -402,6 +617,83 @@ class Application {
         if (wanted == timerPeriod_) return;
         KillTimer(window_, kTick); timerPeriod_ = 0;
         if (wanted && SetTimer(window_, kTick, wanted, nullptr)) timerPeriod_ = wanted;
+    }
+    void moveHover(int position) {
+        if (!loaded_ || !cutty::validDuration(player_.engine()->GetDuration())) return;
+        if (!hoverActive_) {
+            auto* engine = player_.engine();
+            hoverRate_ = engine->IsPaused() ? 0 : engine->GetPlaybackRate();
+            oldMuted_ = engine->GetMuted() != FALSE;
+            require(engine->Pause());
+            require(engine->SetMuted(TRUE));
+            hoverActive_ = true;
+            updateTimer();
+        }
+        hoverFraction_ = std::clamp(position / 10000.0, 0.0, 1.0);
+        KillTimer(window_, kHoverTick);
+        SetTimer(window_, kHoverTick, 33, nullptr);
+        InvalidateRect(timeline_, nullptr, FALSE);
+    }
+    void hoverTick() {
+        KillTimer(window_, kHoverTick);
+        if (!hoverActive_ || !loaded_) return;
+        if (player_.engine()->IsSeeking()) { SetTimer(window_, kHoverTick, 33, nullptr); return; }
+        seek(hoverFraction_ * player_.engine()->GetDuration());
+        update();
+    }
+    void endHover() {
+        KillTimer(window_, kHoverTick);
+        if (!hoverActive_) return;
+        hoverActive_ = false;
+        hoverFraction_ = -1;
+        if (loaded_) {
+            require(player_.engine()->SetMuted(oldMuted_));
+            if (hoverRate_ != 0) playAt(hoverRate_, false);
+            else update();
+        }
+        InvalidateRect(timeline_, nullptr, FALSE);
+    }
+    void clearPreviews() {
+        ++previewState_->generation;
+        for (auto& frame : previews_) frame = {};
+        waveform_.clear();
+        {
+            std::lock_guard lock(previewState_->mutex);
+            previewState_->ready.clear();
+            previewState_->waveform.clear();
+            previewState_->waveformGeneration = 0;
+        }
+        if (timeline_ && IsWindow(timeline_)) InvalidateRect(timeline_, nullptr, FALSE);
+    }
+    void startPreviews() {
+        if (!loaded_ || previewStarted_) return;
+        previewStarted_ = true;
+        const ULONG generation = previewState_->generation.load();
+        const fs::path path = source_;
+        auto state = previewState_;
+        try {
+            if (player_.engine()->HasVideo())
+                std::thread([state, path, generation] { generatePreviews(state, path, generation); }).detach();
+            else
+                std::thread([state, path, generation] { generateWaveform(state, path, generation); }).detach();
+        } catch (...) { previewStarted_ = false; }
+    }
+    void receivePreviews() {
+        std::deque<PendingPreview> ready;
+        {
+            std::lock_guard lock(previewState_->mutex);
+            ready.swap(previewState_->ready);
+            if (previewState_->waveformGeneration == previewState_->generation.load() &&
+                !previewState_->waveform.empty()) {
+                waveform_ = std::move(previewState_->waveform);
+                previewState_->waveformGeneration = 0;
+            }
+        }
+        const ULONG generation = previewState_->generation.load();
+        for (auto& item : ready)
+            if (item.generation == generation && item.index < previews_.size())
+                previews_[item.index] = std::move(item.frame);
+        InvalidateRect(timeline_, nullptr, FALSE);
     }
     fs::path chooseFile(bool saving) {
         ComPtr<IFileDialog> dialog;
@@ -435,11 +727,12 @@ class Application {
         const auto native = path.native();
         if (native.rfind(L"\\\\", 0) == 0) { status(L"此原型只打开本机文件，请先复制到本地磁盘。"); return; }
         if (!initialized_) { pendingSource_ = path; return; }
+        endHover();
+        clearPreviews();
         KillTimer(window_, kTick); timerPeriod_ = 0;
-        loaded_ = false; framePending_ = false; loopSeeking_ = false;
+        loaded_ = false; framePending_ = false; loopSeeking_ = false; previewStarted_ = false;
         temporaryShuttle_ = false; jklRate_ = 0; chosenRate_ = 1; markers_.clear();
         source_ = path; firstFrameRecorded_ = false; autoplayPending_ = true;
-        SendMessageW(speed_, CB_SETCURSEL, 1, 0);
         opened_ = std::chrono::steady_clock::now();
         message_ = L"正在打开…"; update();
         try { player_.open(window_, path); }
@@ -520,8 +813,12 @@ class Application {
         case kClear: markers_.clear(); status(L"已清除 A/B"); break;
         case kLoop: loop_ = !loop_; status(loop_ ? L"循环已开启" : L"循环已关闭"); break;
         case kMute: require(engine->SetMuted(!engine->GetMuted())); update(); break;
+        case kRestart: seek(0); playAt(chosenRate_); break;
         case kScreenshot: screenshot(); break;
-        default: break;
+        default:
+            if (id >= kSpeedFirst && id < kSpeedFirst + static_cast<int>(ARRAYSIZE(kSpeedOrder)))
+                playAt(kSpeedOrder[id - kSpeedFirst]);
+            break;
         }
     }
     void mediaEvent(DWORD event, ULONG generation) {
@@ -529,7 +826,9 @@ class Application {
         auto* engine = player_.engine();
         switch (event) {
         case MF_MEDIA_ENGINE_EVENT_LOADEDMETADATA:
-            loaded_ = true; status(L"已加载，正在准备播放…"); break;
+            loaded_ = true; status(L"已加载，正在准备播放…");
+            if (!engine->HasVideo()) startPreviews();
+            break;
         case MF_MEDIA_ENGINE_EVENT_CANPLAY:
             if (loaded_ && autoplayPending_) { autoplayPending_ = false; playAt(chosenRate_); }
             break;
@@ -539,6 +838,7 @@ class Application {
                     std::chrono::steady_clock::now() - opened_).count();
                 status(L"首帧就绪 " + std::to_wstring(milliseconds) + L" ms（不含启动）");
                 firstFrameRecorded_ = true;
+                startPreviews();
             }
             player_.render(true); break;
         case MF_MEDIA_ENGINE_EVENT_FRAMESTEPCOMPLETED:
@@ -558,7 +858,7 @@ class Application {
             ComPtr<IMFMediaError> error;
             HRESULT code = E_FAIL;
             if (SUCCEEDED(engine->GetError(&error)) && error) code = error->GetExtendedErrorCode();
-            loaded_ = false; framePending_ = false;
+            loaded_ = false; framePending_ = false; clearPreviews();
             player_.close(); player_.render(true);
             status(L"此素材无法播放（系统编解码器或文件错误）：" + errorText(code)); break;
         }
@@ -586,13 +886,125 @@ class Application {
 
 public:
     explicit Application(fs::path source) : pendingSource_(std::move(source)) {}
-    ~Application() { player_.close(); if (font_) DeleteObject(font_); }
+    ~Application() { player_.close(); if (font_) DeleteObject(font_); if (backgroundBrush_) DeleteObject(backgroundBrush_); }
+    HBRUSH backgroundBrush() const { return backgroundBrush_; }
+    void drawButton(const DRAWITEMSTRUCT& item) const {
+        const int id = static_cast<int>(item.CtlID);
+        bool active = id == kLoop && loop_;
+        if (id == kMute && loaded_ && player_.engine()) active = player_.engine()->GetMuted() != FALSE;
+        if (id >= kSpeedFirst && id < kSpeedFirst + static_cast<int>(ARRAYSIZE(kSpeedOrder))) {
+            auto* engine = player_.engine();
+            const double rate = loaded_ && engine && !engine->IsPaused() ? std::abs(engine->GetPlaybackRate()) : chosenRate_;
+            active = std::abs(rate - kSpeedOrder[id - kSpeedFirst]) < 0.001;
+        }
+        FillRect(item.hDC, &item.rcItem, backgroundBrush_);
+        const COLORREF fill = (item.itemState & ODS_DISABLED) ? RGB(39, 39, 39) :
+            active ? kBlue : (item.itemState & ODS_SELECTED) ? RGB(77, 77, 77) : kControl;
+        HBRUSH brush = CreateSolidBrush(fill);
+        HPEN pen = CreatePen(PS_SOLID, 1, fill);
+        HGDIOBJ oldBrush = SelectObject(item.hDC, brush);
+        HGDIOBJ oldPen = SelectObject(item.hDC, pen);
+        const RECT& r = item.rcItem;
+        RoundRect(item.hDC, r.left + 1, r.top + 1, r.right - 1, r.bottom - 1, scale(8), scale(8));
+        SelectObject(item.hDC, oldBrush); SelectObject(item.hDC, oldPen);
+        DeleteObject(brush); DeleteObject(pen);
+        wchar_t title[64]{}; GetWindowTextW(item.hwndItem, title, ARRAYSIZE(title));
+        SetBkMode(item.hDC, TRANSPARENT);
+        SetTextColor(item.hDC, (item.itemState & ODS_DISABLED) ? RGB(125, 125, 125) : RGB(245, 245, 245));
+        HGDIOBJ oldFont = SelectObject(item.hDC, font_);
+        RECT textRect = item.rcItem;
+        DrawTextW(item.hDC, title, -1, &textRect, DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_END_ELLIPSIS);
+        SelectObject(item.hDC, oldFont);
+        if (item.itemState & ODS_FOCUS) {
+            RECT focus = item.rcItem; InflateRect(&focus, -scale(3), -scale(3)); DrawFocusRect(item.hDC, &focus);
+        }
+    }
+    void paintTimeline(HDC dc, const RECT& bounds) const {
+        HBRUSH base = CreateSolidBrush(RGB(31, 31, 31));
+        FillRect(dc, &bounds, base); DeleteObject(base);
+        const int width = bounds.right - bounds.left;
+        if (!waveform_.empty()) {
+            HBRUSH barBrush = CreateSolidBrush(RGB(26, 125, 209));
+            const int height = bounds.bottom - bounds.top;
+            for (size_t i = 0; i < waveform_.size(); ++i) {
+                const int x0 = bounds.left + static_cast<int>(i * width / waveform_.size());
+                const int x1 = bounds.left + static_cast<int>((i + 1) * width / waveform_.size());
+                const int barHeight = std::max(scale(2), static_cast<int>(height * waveform_[i]));
+                RECT bar{x0 + 1, bounds.top + (height - barHeight) / 2,
+                    std::max(x0 + 2, x1 - 1), bounds.top + (height + barHeight) / 2};
+                FillRect(dc, &bar, barBrush);
+            }
+            DeleteObject(barBrush);
+        } else for (int i = 0; i < 10; ++i) {
+            RECT cell{bounds.left + i * width / 10 + 1, bounds.top + 1,
+                bounds.left + (i + 1) * width / 10 - 1, bounds.bottom - 1};
+            const auto& frame = previews_[i];
+            if (frame.width && frame.height && !frame.pixels.empty()) {
+                BITMAPINFO info{};
+                info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+                info.bmiHeader.biWidth = static_cast<LONG>(frame.width);
+                info.bmiHeader.biHeight = -static_cast<LONG>(frame.height);
+                info.bmiHeader.biPlanes = 1;
+                info.bmiHeader.biBitCount = 32;
+                info.bmiHeader.biCompression = BI_RGB;
+                const int cellWidth = cell.right - cell.left, cellHeight = cell.bottom - cell.top;
+                int sourceX = 0, sourceY = 0;
+                int sourceWidth = static_cast<int>(frame.width), sourceHeight = static_cast<int>(frame.height);
+                if (static_cast<long long>(sourceWidth) * cellHeight > static_cast<long long>(sourceHeight) * cellWidth) {
+                    sourceWidth = std::max(1, sourceHeight * cellWidth / std::max(1, cellHeight));
+                    sourceX = (static_cast<int>(frame.width) - sourceWidth) / 2;
+                } else {
+                    sourceHeight = std::max(1, sourceWidth * cellHeight / std::max(1, cellWidth));
+                    sourceY = (static_cast<int>(frame.height) - sourceHeight) / 2;
+                }
+                SetStretchBltMode(dc, HALFTONE);
+                StretchDIBits(dc, cell.left, cell.top, cellWidth, cellHeight,
+                    sourceX, sourceY, sourceWidth, sourceHeight,
+                    frame.pixels.data(), &info, DIB_RGB_COLORS, SRCCOPY);
+            } else {
+                HBRUSH fill = CreateSolidBrush(RGB(51, 51, 51));
+                FillRect(dc, &cell, fill); DeleteObject(fill);
+            }
+            FrameRect(dc, &cell, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+        }
+        auto* engine = player_.engine();
+        const double duration = loaded_ && engine ? engine->GetDuration() : 0;
+        if (!cutty::validDuration(duration)) return;
+        if (markers_.a && markers_.b && *markers_.a < *markers_.b) {
+            HBRUSH outside = CreateSolidBrush(RGB(35, 35, 35));
+            RECT left{bounds.left, bounds.top, bounds.left + static_cast<int>(width * *markers_.a / duration), bounds.bottom};
+            RECT right{bounds.left + static_cast<int>(width * *markers_.b / duration), bounds.top, bounds.right, bounds.bottom};
+            FillRect(dc, &left, outside); FillRect(dc, &right, outside); DeleteObject(outside);
+        }
+        SetBkMode(dc, TRANSPARENT);
+        HGDIOBJ oldFont = SelectObject(dc, font_);
+        HPEN markerPen = CreatePen(PS_SOLID, std::max(1, scale(2)), RGB(255, 214, 10));
+        HGDIOBJ oldPen = SelectObject(dc, markerPen);
+        for (const auto& marker : {std::pair{markers_.a, L"A"}, std::pair{markers_.b, L"B"}}) {
+            if (!marker.first) continue;
+            const int x = bounds.left + static_cast<int>(width * *marker.first / duration);
+            MoveToEx(dc, x, bounds.top, nullptr); LineTo(dc, x, bounds.bottom);
+            RECT label{x + scale(3), bounds.top + scale(2), x + scale(20), bounds.top + scale(19)};
+            SetTextColor(dc, RGB(255, 214, 10));
+            DrawTextW(dc, marker.second, -1, &label, DT_SINGLELINE | DT_LEFT | DT_TOP);
+        }
+        SelectObject(dc, oldPen); DeleteObject(markerPen);
+        const double fraction = hoverFraction_ >= 0 ? hoverFraction_ :
+            cutty::boundedTime(engine->GetCurrentTime(), duration) / duration;
+        HPEN playhead = CreatePen(PS_SOLID, std::max(1, scale(2)), RGB(240, 240, 240));
+        oldPen = SelectObject(dc, playhead);
+        const int x = bounds.left + static_cast<int>(width * fraction);
+        MoveToEx(dc, x, bounds.top, nullptr); LineTo(dc, x, bounds.bottom);
+        SelectObject(dc, oldPen); DeleteObject(playhead);
+        SelectObject(dc, oldFont);
+    }
+    void clickVideo() { command(kPlay); }
     bool keyboard(const MSG& message) {
         if (message.message != WM_KEYDOWN && message.message != WM_KEYUP) return false;
         if (GetAncestor(message.hwnd, GA_ROOT) != window_) return false;
-        // Preserve combo selection and any text input instead of stealing keys.
+        // Preserve text input instead of stealing keys.
         wchar_t name[32]{}; GetClassNameW(GetFocus(), name, ARRAYSIZE(name));
-        if (wcscmp(name, L"Edit") == 0 || (GetFocus() == speed_ && message.wParam != VK_ESCAPE)) return false;
+        if (wcscmp(name, L"Edit") == 0) return false;
         const bool down = message.message == WM_KEYDOWN;
         const bool repeat = (message.lParam & (1ll << 30)) != 0;
         const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
@@ -657,7 +1069,9 @@ public:
     }
     LRESULT handle(UINT message, WPARAM wparam, LPARAM lparam) {
         switch (message) {
-        case WM_CREATE: createControls(); PostMessageW(window_, kInitialize, 0, 0); return 0;
+        case WM_CREATE:
+            previewState_->window.store(window_);
+            createControls(); PostMessageW(window_, kInitialize, 0, 0); return 0;
         case kInitialize:
             player_.initialize(video_); initialized_ = true;
             if (!pendingSource_.empty()) { const auto path = pendingSource_; pendingSource_.clear(); open(path); }
@@ -671,26 +1085,33 @@ public:
         }
         case WM_GETMINMAXINFO: {
             auto* info = reinterpret_cast<MINMAXINFO*>(lparam);
-            info->ptMinTrackSize = POINT{scale(980), scale(480)}; return 0;
+            info->ptMinTrackSize = POINT{scale(900), scale(680)}; return 0;
+        }
+        case WM_ERASEBKGND: {
+            RECT bounds{}; GetClientRect(window_, &bounds);
+            FillRect(reinterpret_cast<HDC>(wparam), &bounds, backgroundBrush_); return 1;
+        }
+        case WM_CTLCOLORSTATIC:
+            SetBkColor(reinterpret_cast<HDC>(wparam), kBackground);
+            SetTextColor(reinterpret_cast<HDC>(wparam), RGB(218, 218, 218));
+            return reinterpret_cast<LRESULT>(backgroundBrush_);
+        case WM_DRAWITEM: {
+            const auto* item = reinterpret_cast<const DRAWITEMSTRUCT*>(lparam);
+            if (item && item->CtlType == ODT_BUTTON) { drawButton(*item); return TRUE; }
+            return FALSE;
         }
         case WM_COMMAND:
-            if (LOWORD(wparam) == kSpeed && HIWORD(wparam) == CBN_SELCHANGE && loaded_) {
-                static constexpr double rates[] = {0.5, 1, 1.5, 2, 4, 8};
-                const auto index = SendMessageW(speed_, CB_GETCURSEL, 0, 0);
-                if (index >= 0 && index < static_cast<LRESULT>(ARRAYSIZE(rates))) playAt(rates[index]);
-            } else if (HIWORD(wparam) == BN_CLICKED) { command(LOWORD(wparam)); SetFocus(window_); }
+            if (HIWORD(wparam) == BN_CLICKED) { command(LOWORD(wparam)); SetFocus(window_); }
             return 0;
-        case WM_HSCROLL:
-            if (reinterpret_cast<HWND>(lparam) == seek_ && loaded_) {
-                const auto event = LOWORD(wparam);
-                dragging_ = event == TB_THUMBTRACK;
-                if (!dragging_) {
-                    const double fraction = static_cast<double>(SendMessageW(seek_, TBM_GETPOS, 0, 0)) / 10000.0;
-                    seek(fraction * player_.engine()->GetDuration());
-                    update(); SetFocus(window_);
-                }
+        case WM_VSCROLL:
+            if (reinterpret_cast<HWND>(lparam) == volume_ && loaded_) {
+                const double volume = std::clamp(HIWORD(wparam) / 100.0, 0.0, 1.0);
+                require(player_.engine()->SetVolume(volume)); update();
             }
             return 0;
+        case kTimelineMove: moveHover(static_cast<int>(wparam)); return 0;
+        case kTimelineLeave: endHover(); return 0;
+        case kPreviewReady: receivePreviews(); return 0;
         case WM_DROPFILES: {
             const auto drop = reinterpret_cast<HDROP>(wparam);
             const UINT length = DragQueryFileW(drop, 0, nullptr, 0);
@@ -699,14 +1120,20 @@ public:
             if (length) open(fs::path(name.data())); SetFocus(window_); return 0;
         }
         case kMediaEvent: mediaEvent(static_cast<DWORD>(wparam), static_cast<ULONG>(lparam)); return 0;
-        case WM_TIMER: if (wparam == kTick) tick(); return 0;
+        case WM_TIMER:
+            if (wparam == kTick) tick();
+            else if (wparam == kHoverTick) hoverTick();
+            return 0;
         case WM_ACTIVATE:
+            if (LOWORD(wparam) == WA_INACTIVE) endHover();
             if (LOWORD(wparam) == WA_INACTIVE && temporaryShuttle_) {
                 temporaryShuttle_ = false; if (loaded_) playAt(resumeRate_, false);
             }
             return 0;
         case WM_DESTROY:
-            KillTimer(window_, kTick); player_.close(); loaded_ = false;
+            KillTimer(window_, kTick); KillTimer(window_, kHoverTick);
+            previewState_->window.store(nullptr); clearPreviews();
+            hoverActive_ = false; player_.close(); loaded_ = false;
             PostQuitMessage(0); return 0;
         default: return DefWindowProcW(window_, message, wparam, lparam);
         }
@@ -734,7 +1161,87 @@ LRESULT CALLBACK videoProcedure(HWND window, UINT message, WPARAM wparam, LPARAM
         catch (...) { if (app) app->failed(E_FAIL); }
         EndPaint(window, &paint); return 0;
     }
-    if (message == WM_LBUTTONDOWN) { SetFocus(GetParent(window)); return 0; }
+    if (message == WM_LBUTTONDOWN) { SetFocus(GetParent(window)); SetCapture(window); return 0; }
+    if (message == WM_LBUTTONUP) {
+        if (GetCapture() == window) ReleaseCapture();
+        RECT bounds{}; GetClientRect(window, &bounds);
+        const POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+        if (PtInRect(&bounds, point)) {
+            auto* app = reinterpret_cast<Application*>(GetWindowLongPtrW(GetParent(window), GWLP_USERDATA));
+            try { if (app) app->clickVideo(); }
+            catch (const Failure& error) { if (app) app->failed(error.code); }
+            catch (...) { if (app) app->failed(E_FAIL); }
+        }
+        return 0;
+    }
+    if (message == WM_ERASEBKGND) return 1;
+    return DefWindowProcW(window, message, wparam, lparam);
+}
+LRESULT CALLBACK timelineProcedure(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
+    if (message == WM_PAINT) {
+        PAINTSTRUCT paint{}; HDC dc = BeginPaint(window, &paint);
+        RECT bounds{}; GetClientRect(window, &bounds);
+        auto* app = reinterpret_cast<Application*>(GetWindowLongPtrW(GetParent(window), GWLP_USERDATA));
+        if (app) app->paintTimeline(dc, bounds);
+        EndPaint(window, &paint); return 0;
+    }
+    if (message == WM_MOUSEMOVE || message == WM_LBUTTONDOWN) {
+        TRACKMOUSEEVENT tracking{sizeof(tracking), TME_LEAVE, window, 0}; TrackMouseEvent(&tracking);
+        if (message == WM_LBUTTONDOWN) { SetFocus(GetParent(window)); SetCapture(window); }
+        RECT bounds{}; GetClientRect(window, &bounds);
+        const int width = std::max(1L, bounds.right - bounds.left);
+        const int position = std::clamp(MulDiv(GET_X_LPARAM(lparam), 10000, width), 0, 10000);
+        SendMessageW(GetParent(window), kTimelineMove, static_cast<WPARAM>(position), 0);
+        return 0;
+    }
+    if (message == WM_LBUTTONUP) {
+        if (GetCapture() == window) ReleaseCapture();
+        RECT bounds{}; GetClientRect(window, &bounds);
+        if (!PtInRect(&bounds, POINT{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)}))
+            SendMessageW(GetParent(window), kTimelineLeave, 0, 0);
+        return 0;
+    }
+    if (message == WM_MOUSELEAVE) { SendMessageW(GetParent(window), kTimelineLeave, 0, 0); return 0; }
+    if (message == WM_ERASEBKGND) return 1;
+    return DefWindowProcW(window, message, wparam, lparam);
+}
+LRESULT CALLBACK volumeProcedure(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
+    if (message == WM_PAINT) {
+        PAINTSTRUCT paint{}; HDC dc = BeginPaint(window, &paint);
+        RECT bounds{}; GetClientRect(window, &bounds);
+        HBRUSH background = CreateSolidBrush(kBackground);
+        FillRect(dc, &bounds, background); DeleteObject(background);
+        RECT track{bounds.left + 5, bounds.top + 3, bounds.right - 5, bounds.bottom - 3};
+        HBRUSH gray = CreateSolidBrush(RGB(46, 46, 46));
+        HPEN outline = CreatePen(PS_SOLID, 1, RGB(46, 46, 46));
+        HGDIOBJ oldBrush = SelectObject(dc, gray), oldPen = SelectObject(dc, outline);
+        RoundRect(dc, track.left, track.top, track.right, track.bottom, 8, 8);
+        SelectObject(dc, oldBrush); SelectObject(dc, oldPen);
+        DeleteObject(gray); DeleteObject(outline);
+        const int value = std::clamp(static_cast<int>(GetWindowLongPtrW(window, GWLP_USERDATA)), 0, 100);
+        RECT filled{track.left, track.bottom - MulDiv(track.bottom - track.top, value, 100), track.right, track.bottom};
+        HBRUSH blue = CreateSolidBrush(kBlue);
+        FillRect(dc, &filled, blue); DeleteObject(blue);
+        EndPaint(window, &paint); return 0;
+    }
+    auto change = [&](int y) {
+        RECT bounds{}; GetClientRect(window, &bounds);
+        const int value = std::clamp(MulDiv(bounds.bottom - y, 100, std::max(1L, bounds.bottom - bounds.top)), 0, 100);
+        SetWindowLongPtrW(window, GWLP_USERDATA, value);
+        InvalidateRect(window, nullptr, FALSE);
+        SendMessageW(GetParent(window), WM_VSCROLL, MAKEWPARAM(TB_THUMBTRACK, value), reinterpret_cast<LPARAM>(window));
+    };
+    if (message == WM_LBUTTONDOWN) { SetFocus(GetParent(window)); SetCapture(window); change(GET_Y_LPARAM(lparam)); return 0; }
+    if (message == WM_MOUSEMOVE && (wparam & MK_LBUTTON)) { change(GET_Y_LPARAM(lparam)); return 0; }
+    if (message == WM_LBUTTONUP) { if (GetCapture() == window) ReleaseCapture(); return 0; }
+    if (message == WM_MOUSEWHEEL) {
+        const int value = std::clamp(static_cast<int>(GetWindowLongPtrW(window, GWLP_USERDATA)) +
+            (GET_WHEEL_DELTA_WPARAM(wparam) > 0 ? 5 : -5), 0, 100);
+        SetWindowLongPtrW(window, GWLP_USERDATA, value);
+        InvalidateRect(window, nullptr, FALSE);
+        SendMessageW(GetParent(window), WM_VSCROLL, MAKEWPARAM(TB_THUMBTRACK, value), reinterpret_cast<LPARAM>(window));
+        return 0;
+    }
     if (message == WM_ERASEBKGND) return 1;
     return DefWindowProcW(window, message, wparam, lparam);
 }
@@ -760,11 +1267,16 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         cls.hInstance = instance; cls.lpfnWndProc = Application::procedure;
         cls.lpszClassName = L"AIVideoCuttyWindows";
         cls.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-        cls.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
-        cls.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
+        cls.hIcon = LoadIconW(instance, MAKEINTRESOURCEW(1));
+        cls.hIconSm = static_cast<HICON>(LoadImageW(instance, MAKEINTRESOURCEW(1), IMAGE_ICON, 16, 16, 0));
+        cls.hbrBackground = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
         RegisterClassExW(&cls);
         cls.lpszClassName = L"CuttyVideoSurface"; cls.lpfnWndProc = videoProcedure;
         cls.hbrBackground = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
+        RegisterClassExW(&cls);
+        cls.lpszClassName = L"CuttyTimeline"; cls.lpfnWndProc = timelineProcedure;
+        RegisterClassExW(&cls);
+        cls.lpszClassName = L"CuttyVolume"; cls.lpfnWndProc = volumeProcedure;
         RegisterClassExW(&cls);
         // CreateWindowExW takes physical pixels; the control layout uses DPI-scaled units.
         const UINT initialDpi = GetDpiForSystem();
