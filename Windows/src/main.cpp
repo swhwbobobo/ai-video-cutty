@@ -1,5 +1,6 @@
 #include <windows.h>
 #include <windowsx.h>
+#include <imm.h>
 #include <commctrl.h>
 #include <shellapi.h>
 #include <shobjidl.h>
@@ -1075,7 +1076,7 @@ public:
         case 'R': seek(0); playAt(chosenRate_); return true;
         case 'J': case 'L':
             jklRate_ = cutty::shuttleRate(jklRate_, key == 'L'); playAt(jklRate_); return true;
-        case 'K': jklRate_ = 0; require(player_.engine()->Pause()); updateTimer(); update(); return true;
+        case 'K': jklRate_ = 0; require(player_.engine()->Pause()); message_ = L"已暂停"; updateTimer(); update(); return true;
         default: return false;
         }
     }
@@ -1303,6 +1304,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
             nullptr, nullptr, instance, &app);
         if (!window) result = 1;
         else {
+            // This window has no text fields. Keep playback shortcuts available under Chinese IMEs;
+            // common file dialogs are separate windows and retain their normal text input.
+            ImmAssociateContextEx(window, nullptr, IACE_CHILDREN);
             ShowWindow(window, show); UpdateWindow(window);
             MSG message{};
             while (true) {

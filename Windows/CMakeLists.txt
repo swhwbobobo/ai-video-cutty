@@ -20,7 +20,7 @@ if(WIN32)
   target_compile_definitions(AIVideoCutty PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN
     WINVER=0x0A00 _WIN32_WINNT=0x0A00)
   target_link_libraries(AIVideoCutty PRIVATE mfplat mf mfuuid mfreadwrite d3d11 dxgi
-    windowscodecs ole32 oleaut32 comctl32 shell32 shlwapi propsys)
+    windowscodecs ole32 oleaut32 comctl32 shell32 shlwapi propsys imm32)
   if(MSVC)
     target_compile_options(AIVideoCutty PRIVATE /W4 /permissive- /utf-8)
     target_compile_options(playback_rules_tests PRIVATE /W4 /permissive- /utf-8)
