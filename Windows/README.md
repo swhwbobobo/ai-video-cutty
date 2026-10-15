@@ -29,9 +29,9 @@
 
 界面沿用现有预览结构：中间画面、左侧竖向音量与静音/回到开头/截图、右侧竖排倍速与循环/清除 A-B，画面下方为 76 单位高的时间线。移到时间线上会暂停、静音并预览对应位置，移开后恢复此前的声音和播放速度。视频时间线只保留 10 张缩略图，音频波形只保留 240 个峰值；两者在后台按需生成，不缓存整片画面。
 
-右侧倍速按钮为 8×、4×、2×、1.5×、1.25×、1×、0.75×、0.5×。只设 A 或只设 B，另一个端点分别默认为片尾或片头；清除后循环整个文件。倒放和倍速取决于系统解码器和素材，能力不足时显示提示，不静默转码。
+右侧倍速按钮为 8×、4×、2×、1.5×、1.25×、1×、0.75×、0.5×。只设 A 或只设 B，另一个端点分别默认为片尾或片头；清除后循环整个文件。倒放和倍速取决于系统解码器和素材，能力查询不支持时显示提示，不静默转码。Windows 11 实测中，一段 H.264/AAC MP4 按 J 后时间仍向前到片尾；即使系统报告支持，也不能据此认定该素材的倒放可用。
 
-截图先暂停，保存为实际解码帧尺寸的 JPG，不包含窗口控件。只创建新文件；已有文件拒绝覆盖，取消不写文件。截图使用同目录临时文件，编码成功后才发布；失败清理本次临时文件。
+截图保存为实际解码帧尺寸的 JPG，不包含窗口控件；操作结束后恢复此前的播放状态。只创建新文件；已有文件拒绝覆盖，取消不写文件。截图使用同目录临时文件，编码成功后才发布；失败清理本次临时文件。
 
 ## 在 Windows 编译
 
@@ -64,6 +64,6 @@ GitHub Actions 的 Windows 作业构建 Release、运行播放规则测试并输
 
 Windows 10 和 11 各验证：打开中文/空格/长路径文件，1080p 与 4K、H.264/AAC、MOV、HEVC、VFR、长 GOP、无音轨、音频文件；暂停前后逐帧、松键恢复、循环端点、拖动、截图分辨率、截图冲突和取消、连续换片、全屏/DPI/多屏及退出资源释放。
 
-分别记录 EXE/分发体积、冷/热启动到窗口、打开到实际首帧、总 Private Bytes、CPU/GPU、播放丢帧与退出残留。当前原型没有这些实机数据，不能将“小 EXE”当作“播放一定轻”。
+分别记录 EXE/分发体积、冷/热启动到窗口、打开到实际首帧、总 Private Bytes、CPU/GPU、播放丢帧与退出残留。PR 中记录了 Windows 11 单次 1080p/4K 资源读数，冷/热启动和 Windows 10 数据仍缺；不能将“小 EXE”当作“播放一定轻”。
 
 相关接口：[FrameStep](https://learn.microsoft.com/en-us/windows/win32/api/mfmediaengine/nf-mfmediaengine-imfmediaengineex-framestep)、[播放速度能力](https://learn.microsoft.com/en-us/windows/win32/api/mfmediaengine/nf-mfmediaengine-imfmediaengineex-isplaybackratesupported)、[原始帧输出](https://learn.microsoft.com/en-us/windows/win32/api/mfmediaengine/nf-mfmediaengine-imfmediaengine-transfervideoframe)。
