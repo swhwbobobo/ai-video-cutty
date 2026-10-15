@@ -772,15 +772,32 @@ class Application {
     }
     void screenshot() {
         if (!loaded_ || framePending_ || player_.engine()->IsSeeking()) return;
+        endHover();
+        const bool wasPlaying = !player_.engine()->IsPaused();
+        const double previousRate = player_.engine()->GetPlaybackRate();
         require(player_.engine()->Pause());
         updateTimer(); update();
-        const auto destination = chooseFile(true);
-        if (destination.empty()) return;
-        auto extension = destination.extension().wstring();
-        for (auto& c : extension) c = static_cast<wchar_t>(towlower(c));
-        if (extension != L".jpg" && extension != L".jpeg") { status(L"截图请使用 .jpg 或 .jpeg 文件名。"); return; }
-        player_.screenshot(destination);
-        status(L"已保存：" + destination.filename().wstring());
+        fs::path destination;
+        std::wstring feedback;
+        try {
+            destination = chooseFile(true);
+            if (!destination.empty()) {
+                auto extension = destination.extension().wstring();
+                for (auto& c : extension) c = static_cast<wchar_t>(towlower(c));
+                if (extension != L".jpg" && extension != L".jpeg") {
+                    feedback = L"截图请使用 .jpg 或 .jpeg 文件名。";
+                    destination.clear();
+                } else player_.screenshot(destination);
+            }
+        } catch (...) {
+            if (wasPlaying) {
+                try { playAt(previousRate, false); } catch (...) {}
+            }
+            throw;
+        }
+        if (wasPlaying) playAt(previousRate, false);
+        if (!feedback.empty()) status(feedback);
+        else if (!destination.empty()) status(L"已保存：" + destination.filename().wstring());
     }
     void fullscreen() {
         if (!fullscreen_) {
